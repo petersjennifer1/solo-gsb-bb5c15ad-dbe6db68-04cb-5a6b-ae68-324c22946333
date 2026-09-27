@@ -38,7 +38,8 @@ const state = {
   claims: [],      // 主持人：全部命题（逐组报告）；参与者：白名单含本组的命题（本组报告+汇总）；观察者：永远为空
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
-  latency: { round: null, data: null, timer: 0 }, // 主持人响应时效面板（round=null 跟随当前轮）
+  // 主持人响应时效面板（round=null 跟随当前轮；seq 为报告请求序号，迟到的旧响应按序号丢弃）
+  latency: { round: null, data: null, timer: 0, seq: 0 },
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
   ws: null,
@@ -1278,16 +1279,30 @@ function fmtDelta(ms) {
   return hh > 0 ? `${hh}:${mm}:${ss}.${mmm}` : `${mm}:${ss}.${mmm}`;
 }
 
+/* 换房 / 离开 / 重新进入时调用：清空面板并递增请求序号，使在途的旧请求失效——
+   其响应（无论成功或失败）回来时序号都对不上，绝不写入新房间的面板 */
+function resetLatencyState() {
+  clearTimeout(state.latency.timer);
+  state.latency = { round: null, data: null, timer: 0, seq: state.latency.seq + 1 };
+}
+
 /* 拉取所选轮次的响应时效报告。服务端在状态锁内固定事件水位后统计：
-   暂停时长不计入，撤销回执/修改答复不改首次响应时间，未响应为 null（未达）。 */
+   暂停时长不计入，撤销回执/修改答复不改首次响应时间，未响应为 null（未达）。
+   发起时绑定房间身份、所选轮次与请求序号，响应回来时逐项核对：只有仍对应
+   当前房间与选择的最新响应才允许写入面板——快速切换轮次或换房后，较早发出
+   的请求即使后返回也被丢弃，不会覆盖当前面板或把他房组名显示在新房间。 */
 async function refreshLatency() {
   if (state.role !== 'host' || !state.code) return;
+  const code = state.code;
   const round = state.latency.round == null ? state.round : state.latency.round;
+  const seq = ++state.latency.seq;
   try {
-    const data = await api('GET', `/api/rooms/${state.code}/latency?round=${round}`);
+    const data = await api('GET', `/api/rooms/${code}/latency?round=${round}`);
+    const want = state.latency.round == null ? state.round : state.latency.round;
+    if (seq !== state.latency.seq || code !== state.code || round !== want) return;
     state.latency.data = data;
     renderLatency();
-  } catch (err) { /* 分析数据拉取失败不打断主界面（如轮次已失效） */ }
+  } catch (err) { /* 拉取失败不打断主界面；旧请求失败同样不得清空新报告 */ }
 }
 
 /* 揭示/回执/答复/重置/组增删事件后防抖刷新（面板为拉取式分析，不走增量事件） */
@@ -1771,8 +1786,7 @@ function enterRoom(code, role) {
   state.claims = [];
   state.round = 0;
   state.groupId = null;
-  clearTimeout(state.latency.timer);
-  state.latency = { round: null, data: null, timer: 0 };
+  resetLatencyState(); // 换房/重新进入：旧房间在途报告请求一律失效
   location.hash = `#/${role}/${code}`;
   localStorage.setItem(`inject-role-${code}`, role);
   showRoom();
@@ -1794,8 +1808,7 @@ function enterObserver(token) {
   state.claims = [];
   state.round = 0;
   state.groupId = null;
-  clearTimeout(state.latency.timer);
-  state.latency = { round: null, data: null, timer: 0 };
+  resetLatencyState(); // 换房/重新进入：旧房间在途报告请求一律失效
   location.hash = `#/observe/${token}`;
   showRoom();
   renderAll();
@@ -1805,6 +1818,7 @@ function enterObserver(token) {
 function leaveRoom() {
   if (state.ws) { state.ws.onclose = null; state.ws.close(); }
   state.code = null;
+  resetLatencyState(); // 离开房间：在途报告请求一并失效，不得写回面板
   location.hash = '';
   showLanding();
 }
