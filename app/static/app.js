@@ -38,7 +38,10 @@ const state = {
   claims: [],      // 主持人：全部命题（逐组报告）；参与者：白名单含本组的命题（本组报告+汇总）；观察者：永远为空
   groupId: null,   // 参与者本组 id（主持人/观察者为 null）
   round: 0,        // 当前演练轮次（= 此前 reset 次数；快照权威下发，reset 事件 +1）
-  latency: { round: null, data: null, timer: 0 }, // 主持人响应时效面板（round=null 跟随当前轮）
+  // 主持人响应时效面板（round=null 跟随当前轮）。
+  // epoch：进入/离开房间时递增的会话代号，使上一房间在途请求整体失效；
+  // seq：当前会话内已发起的报告请求序号，仅最新一次请求的响应允许写入面板。
+  latency: { round: null, data: null, timer: 0, epoch: 0, seq: 0 },
   lastEventId: 0,
   clock: { status: 'idle', elapsedMs: 0, syncedAt: performance.now() },
   ws: null,
@@ -1278,32 +1281,74 @@ function fmtDelta(ms) {
   return hh > 0 ? `${hh}:${mm}:${ss}.${mmm}` : `${mm}:${ss}.${mmm}`;
 }
 
-/* 拉取所选轮次的响应时效报告。服务端在状态锁内固定事件水位后统计：
-   暂停时长不计入，撤销回执/修改答复不改首次响应时间，未响应为 null（未达）。 */
-async function refreshLatency() {
-  if (state.role !== 'host' || !state.code) return;
-  const round = state.latency.round == null ? state.round : state.latency.round;
-  try {
-    const data = await api('GET', `/api/rooms/${state.code}/latency?round=${round}`);
-    state.latency.data = data;
-    renderLatency();
-  } catch (err) { /* 分析数据拉取失败不打断主界面（如轮次已失效） */ }
+/* 换房、离开及重新进入时复位面板会话：取消挂起的防抖刷新并推进 epoch，
+   使所有在途的旧请求（含上一房间的请求）在返回时判定失效。 */
+function resetLatencySession() {
+  clearTimeout(state.latency.timer);
+  state.latency = { round: null, data: null, timer: 0,
+                    epoch: state.latency.epoch + 1, seq: 0 };
 }
 
-/* 揭示/回执/答复/重置/组增删事件后防抖刷新（面板为拉取式分析，不走增量事件） */
+/* 响应时效报告的陈旧判定：仅当响应仍对应「发起时的房间 + 当前轮次选择」
+   且它是当前会话最新发出的请求时，才允许写入面板。
+   - epoch 不同：换房/离开/重新进入后返回的旧请求，一律丢弃；
+   - code 不同：响应来自上一房间（防止上一房间组名渲染进新房间面板）；
+   - 轮次不一致：快速切换轮次、或跟随当前轮时发生 reset（轮次 +1）后，
+     较早请求即便后返回也不得覆盖当前选择；
+   - seq 不是最新：同选择下更早发出的请求后返回时丢弃。 */
+function latencyResponseStale(req) {
+  if (req.epoch !== state.latency.epoch) return true;
+  if (req.code !== state.code) return true;
+  const wantRound = state.latency.round == null ? state.round : state.latency.round;
+  if (req.round !== wantRound) return true;
+  return req.seq !== state.latency.seq;
+}
+
+/* 拉取所选轮次的响应时效报告。服务端在状态锁内固定事件水位后统计：
+   暂停时长不计入，撤销回执/修改答复不改首次响应时间，未响应为 null（未达）。
+   请求身份（房间码、所选轮次、会话代号、请求序号）在发起瞬间绑定，
+   轮次选择触发的拉取与实时事件触发的防抖刷新走同一陈旧判定。 */
+async function refreshLatency() {
+  if (state.role !== 'host' || !state.code) return;
+  // 发起瞬间固定身份：round 为发起时解析出的轮次（跟随当前轮也固化为具体值）
+  const req = {
+    code: state.code,
+    round: state.latency.round == null ? state.round : state.latency.round,
+    epoch: state.latency.epoch,
+    seq: ++state.latency.seq,
+  };
+  let data;
+  try {
+    data = await api('GET', `/api/rooms/${req.code}/latency?round=${req.round}`);
+  } catch (err) {
+    // 拉取失败（轮次失效、网络抖动、换房后在途的旧请求等）一律静默忽略：
+    // 既不清空也不覆盖当前报告，下一次轮次切换/事件刷新会重新拉取
+    return;
+  }
+  if (latencyResponseStale(req)) return; // 较旧或跨房间响应不得写入面板
+  state.latency.data = data;
+  renderLatency();
+}
+
+/* 揭示/回执/答复/重置/组增删事件后防抖刷新（面板为拉取式分析，不走增量事件）。
+   与轮次切换共用 refreshLatency 的身份绑定与陈旧判定。 */
 function scheduleLatencyRefresh() {
   if (state.role !== 'host') return;
   clearTimeout(state.latency.timer);
-  state.latency.timer = setTimeout(refreshLatency, 400);
+  state.latency.timer = setTimeout(() => {
+    state.latency.timer = 0;
+    refreshLatency();
+  }, 400);
 }
 
 function renderLatency() {
   if (state.role !== 'host') return;
   const data = state.latency.data;
-  const sel = $('#latency-round');
   const cur = data ? data.current_round : state.round;
-  const selected = data ? data.round
-    : (state.latency.round == null ? state.round : state.latency.round);
+  // 选中值以当前轮次选择为准（而非已载入数据的轮次）：快速切轮次时旧数据仍在途，
+  // 其他事件触发整体重渲染也不会把下拉回弹到旧轮次
+  const selected = state.latency.round == null ? state.round : state.latency.round;
+  const sel = $('#latency-round');
   sel.innerHTML = '';
   for (let r = 0; r <= cur; r++) {
     const opt = document.createElement('option');
@@ -1312,10 +1357,14 @@ function renderLatency() {
     sel.appendChild(opt);
   }
   sel.value = String(selected);
-  $('#latency-meta').textContent = data ? `事件水位 #${data.high_water_event_id}` : '';
+  // 渲染保险：缓存数据的轮次与当前选择不一致时（切换轮次/重置后、新响应尚未
+  // 到达的在途窗口），绝不展示错轮内容。跨房间数据在写入时已被陈旧判定拦截，
+  // 且进入/离开房间会清空缓存，不会到达这里
+  const view = data && data.round === selected ? data : null;
+  $('#latency-meta').textContent = view ? `事件水位 #${view.high_water_event_id}` : '';
   const box = $('#latency-groups');
   box.innerHTML = '';
-  const groups = data ? data.groups : [];
+  const groups = view ? view.groups : [];
   const hasCards = groups.some((g) => g.cards.length > 0);
   $('#latency-empty').classList.toggle('hidden', hasCards);
   for (const g of groups) {
@@ -1771,8 +1820,7 @@ function enterRoom(code, role) {
   state.claims = [];
   state.round = 0;
   state.groupId = null;
-  clearTimeout(state.latency.timer);
-  state.latency = { round: null, data: null, timer: 0 };
+  resetLatencySession();
   location.hash = `#/${role}/${code}`;
   localStorage.setItem(`inject-role-${code}`, role);
   showRoom();
@@ -1794,8 +1842,7 @@ function enterObserver(token) {
   state.claims = [];
   state.round = 0;
   state.groupId = null;
-  clearTimeout(state.latency.timer);
-  state.latency = { round: null, data: null, timer: 0 };
+  resetLatencySession();
   location.hash = `#/observe/${token}`;
   showRoom();
   renderAll();
@@ -1805,6 +1852,9 @@ function enterObserver(token) {
 function leaveRoom() {
   if (state.ws) { state.ws.onclose = null; state.ws.close(); }
   state.code = null;
+  // 离开房间：取消挂起的防抖刷新并使所有在途报告请求失效，
+  // 旧响应返回后既不写面板也不触发渲染
+  resetLatencySession();
   location.hash = '';
   showLanding();
 }
